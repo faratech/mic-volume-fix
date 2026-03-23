@@ -221,13 +221,23 @@ fn set_startup(enable: bool) {
     }
 }
 
-/// Try to get the default capture device and its volume control.
-/// Returns (device_name, IAudioEndpointVolume) or None if no mic.
-unsafe fn acquire_mic(
-    enumerator: &IMMDeviceEnumerator,
-) -> Option<(String, IAudioEndpointVolume)> {
+/// Get the device ID of the current default capture device.
+fn get_default_mic_id(enumerator: &IMMDeviceEnumerator) -> Option<String> {
     unsafe {
         let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
+        device.GetId().ok()?.to_string().ok()
+    }
+}
+
+/// Try to get the default capture device and its volume control.
+/// Returns (device_id, device_name, IAudioEndpointVolume) or None if no mic.
+fn acquire_mic(
+    enumerator: &IMMDeviceEnumerator,
+) -> Option<(String, String, IAudioEndpointVolume)> {
+    unsafe {
+        let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
+
+        let device_id = device.GetId().ok()?.to_string().unwrap_or_default();
 
         let props: IPropertyStore = device.OpenPropertyStore(STGM_READ).ok()?;
         let name = props.GetValue(&PKEY_Device_FriendlyName).ok()?;
@@ -236,7 +246,7 @@ unsafe fn acquire_mic(
             .unwrap_or_else(|_| "Unknown".into());
 
         let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None).ok()?;
-        Some((name_str, volume))
+        Some((device_id, name_str, volume))
     }
 }
 
@@ -266,8 +276,9 @@ fn main() {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).expect("No enumerator");
 
-            let mut mic: Option<(String, IAudioEndpointVolume)> = None;
+            let mut mic: Option<(String, String, IAudioEndpointVolume)> = None;
             let mut last_notify = Instant::now() - Duration::from_secs(NOTIFY_COOLDOWN_SECS);
+            let mut iteration: u32 = 0;
 
             loop {
                 // If paused, just sleep
@@ -279,10 +290,11 @@ fn main() {
                 // Try to acquire mic if we don't have one
                 if mic.is_none() {
                     match acquire_mic(&enumerator) {
-                        Some((name, vol)) => {
-                            status_clone.lock().unwrap().device_name = name.clone();
-                            status_clone.lock().unwrap().error = None;
-                            mic = Some((name, vol));
+                        Some((id, name, vol)) => {
+                            let mut s = status_clone.lock().unwrap();
+                            s.device_name = name.clone();
+                            s.error = None;
+                            mic = Some((id, name, vol));
                         }
                         None => {
                             let mut s = status_clone.lock().unwrap();
@@ -294,20 +306,35 @@ fn main() {
                     }
                 }
 
-                let (_name, volume) = mic.as_ref().unwrap();
+                // Periodically check if the default device has changed
+                iteration = iteration.wrapping_add(1);
+                if iteration % 10 == 0 {
+                    if let Some(new_id) = get_default_mic_id(&enumerator) {
+                        let current_id = &mic.as_ref().unwrap().0;
+                        if &new_id != current_id {
+                            // Default device changed — re-acquire
+                            mic = None;
+                            continue;
+                        }
+                    }
+                }
+
+                let (_id, _name, volume) = mic.as_ref().unwrap();
 
                 let mut did_unmute = false;
                 let mut did_fix_volume = false;
+                #[allow(unused_assignments)]
                 let mut old_pct = 100u32;
 
                 // Check mute — if the call fails, the device is gone
                 match volume.GetMute() {
                     Ok(muted) if muted.as_bool() => {
-                        let _ = volume.SetMute(false, std::ptr::null());
-                        let mut s = status_clone.lock().unwrap();
-                        s.last_unmute = Some(Instant::now());
-                        s.unmutes_count += 1;
-                        did_unmute = true;
+                        if volume.SetMute(false, std::ptr::null()).is_ok() {
+                            let mut s = status_clone.lock().unwrap();
+                            s.last_unmute = Some(Instant::now());
+                            s.unmutes_count += 1;
+                            did_unmute = true;
+                        }
                     }
                     Err(_) => {
                         // Device lost — drop and re-acquire next loop
@@ -320,14 +347,25 @@ fn main() {
                     _ => {}
                 }
 
-                if let Ok(current) = volume.GetMasterVolumeLevelScalar() {
-                    old_pct = (current * 100.0).round() as u32;
-                    if old_pct < 100 {
-                        let _ = volume.SetMasterVolumeLevelScalar(1.0, std::ptr::null());
+                match volume.GetMasterVolumeLevelScalar() {
+                    Ok(current) => {
+                        old_pct = (current * 100.0).round() as u32;
+                        if old_pct < 100 {
+                            if volume.SetMasterVolumeLevelScalar(1.0, std::ptr::null()).is_ok() {
+                                let mut s = status_clone.lock().unwrap();
+                                s.last_volume_fix = Some(Instant::now());
+                                s.fixes_count += 1;
+                                did_fix_volume = true;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Device lost — drop and re-acquire next loop
+                        mic = None;
                         let mut s = status_clone.lock().unwrap();
-                        s.last_volume_fix = Some(Instant::now());
-                        s.fixes_count += 1;
-                        did_fix_volume = true;
+                        s.error = Some("Microphone disconnected, reconnecting...".into());
+                        thread::sleep(Duration::from_secs(2));
+                        continue;
                     }
                 }
 
@@ -376,8 +414,9 @@ fn main() {
         .expect("Failed to create tray icon");
 
     let menu_receiver = MenuEvent::receiver().clone();
+    let mut last_menu_update = Instant::now() - Duration::from_secs(1);
 
-    loop {
+    'main: loop {
         if let Ok(event) = menu_receiver.try_recv() {
             if event.id() == quit_item.id() {
                 break;
@@ -406,32 +445,35 @@ fn main() {
                 .show();
         }
 
-        // Update menu items
-        if let Ok(s) = status.lock() {
-            if let Some(ref err) = s.error {
-                device_item.set_text(format!("Mic: {err}"));
-            } else if !s.device_name.is_empty() {
-                device_item.set_text(format!("Mic: {}", s.device_name));
-            }
+        // Update menu items (once per second, not every 100ms)
+        if last_menu_update.elapsed().as_secs() >= 1 {
+            last_menu_update = Instant::now();
+            if let Ok(s) = status.lock() {
+                if let Some(ref err) = s.error {
+                    device_item.set_text(format!("Mic: {err}"));
+                } else if !s.device_name.is_empty() {
+                    device_item.set_text(format!("Mic: {}", s.device_name));
+                }
 
-            if let Some(t) = s.last_volume_fix {
-                let ago = t.elapsed().as_secs();
-                volume_item.set_text(format!(
-                    "Volume fixed: {ago}s ago (total: {})",
-                    s.fixes_count
-                ));
-            } else {
-                volume_item.set_text("Volume: no fixes needed yet");
-            }
+                if let Some(t) = s.last_volume_fix {
+                    let ago = t.elapsed().as_secs();
+                    volume_item.set_text(format!(
+                        "Volume fixed: {ago}s ago (total: {})",
+                        s.fixes_count
+                    ));
+                } else {
+                    volume_item.set_text("Volume: no fixes needed yet");
+                }
 
-            if let Some(t) = s.last_unmute {
-                let ago = t.elapsed().as_secs();
-                unmute_item.set_text(format!(
-                    "Unmuted: {ago}s ago (total: {})",
-                    s.unmutes_count
-                ));
-            } else {
-                unmute_item.set_text("Unmute: no fixes needed yet");
+                if let Some(t) = s.last_unmute {
+                    let ago = t.elapsed().as_secs();
+                    unmute_item.set_text(format!(
+                        "Unmuted: {ago}s ago (total: {})",
+                        s.unmutes_count
+                    ));
+                } else {
+                    unmute_item.set_text("Unmute: no fixes needed yet");
+                }
             }
         }
 
@@ -440,6 +482,9 @@ fn main() {
             use windows_sys::Win32::UI::WindowsAndMessaging::*;
             let mut msg: MSG = std::mem::zeroed();
             while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if msg.message == WM_QUIT {
+                    break 'main;
+                }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
