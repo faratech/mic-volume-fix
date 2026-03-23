@@ -1,0 +1,40 @@
+[package]
+name = "mic_volume_fix"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tray-icon = { version = "0.21", default-features = false }
+tauri-winrt-notification = "0.7"
+
+[profile.release]
+opt-level = "z"        # optimize for size
+lto = true             # link-time optimization - dead code elimination across crates
+codegen-units = 1      # single codegen unit for max optimization
+strip = "symbols"      # strip debug symbols
+panic = "abort"        # smaller than unwind tables
+
+[build-dependencies]
+embed-resource = "3"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Devices_FunctionDiscovery",
+]
+
+[dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+]
