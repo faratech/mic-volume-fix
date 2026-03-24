@@ -20,6 +20,31 @@ use windows::{
 
 const NOTIFY_COOLDOWN_SECS: u64 = 30;
 
+fn format_duration(total_secs: u64) -> String {
+    if total_secs == 0 {
+        return "0s".into();
+    }
+    let years = total_secs / (365 * 86400);
+    let rem = total_secs % (365 * 86400);
+    let weeks = rem / (7 * 86400);
+    let rem = rem % (7 * 86400);
+    let days = rem / 86400;
+    let rem = rem % 86400;
+    let hours = rem / 3600;
+    let rem = rem % 3600;
+    let mins = rem / 60;
+    let secs = rem % 60;
+
+    let mut parts = Vec::new();
+    if years > 0 { parts.push(format!("{years}y")); }
+    if weeks > 0 { parts.push(format!("{weeks}w")); }
+    if days > 0 { parts.push(format!("{days}d")); }
+    if hours > 0 { parts.push(format!("{hours}h")); }
+    if mins > 0 { parts.push(format!("{mins}m")); }
+    if secs > 0 { parts.push(format!("{secs}s")); }
+    parts.join(" ")
+}
+
 struct Status {
     device_name: String,
     last_volume_fix: Option<Instant>,
@@ -143,6 +168,35 @@ fn ensure_single_instance() -> *mut std::ffi::c_void {
     }
 }
 
+/// Enable Windows Efficiency Mode (EcoQoS) for the current process.
+/// Sets idle priority and enables power throttling to minimize battery impact.
+fn enable_efficiency_mode() {
+    use windows_sys::Win32::System::Threading::*;
+
+    unsafe {
+        let handle = GetCurrentProcess();
+
+        // Set to idle priority class (lowest scheduling priority)
+        let _ = SetPriorityClass(handle, IDLE_PRIORITY_CLASS);
+
+        // Enable EcoQoS power throttling
+        let mut throttle_state = PROCESS_POWER_THROTTLING_STATE {
+            Version: 1,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        };
+
+        let _ = SetProcessInformation(
+            handle,
+            ProcessPowerThrottling,
+            &mut throttle_state as *mut _ as *mut _,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
 fn get_exe_path() -> Option<String> {
     std::env::current_exe()
         .ok()
@@ -252,6 +306,7 @@ fn acquire_mic(
 
 fn main() {
     let _mutex = ensure_single_instance();
+    enable_efficiency_mode();
 
     let paused = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new(Status {
@@ -456,9 +511,9 @@ fn main() {
                 }
 
                 if let Some(t) = s.last_volume_fix {
-                    let ago = t.elapsed().as_secs();
+                    let ago = format_duration(t.elapsed().as_secs());
                     volume_item.set_text(format!(
-                        "Volume fixed: {ago}s ago (total: {})",
+                        "Volume fixed: {ago} ago (total: {})",
                         s.fixes_count
                     ));
                 } else {
@@ -466,9 +521,9 @@ fn main() {
                 }
 
                 if let Some(t) = s.last_unmute {
-                    let ago = t.elapsed().as_secs();
+                    let ago = format_duration(t.elapsed().as_secs());
                     unmute_item.set_text(format!(
-                        "Unmuted: {ago}s ago (total: {})",
+                        "Unmuted: {ago} ago (total: {})",
                         s.unmutes_count
                     ));
                 } else {
